@@ -1,0 +1,412 @@
+// Drevn.ai — Prisma Schema
+// Railway + PostgreSQL
+// Multi-tenant: alle tabeller har restaurantId
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── TENANT ────────────────────────────────────────────────────────────────
+
+model Restaurant {
+  id            String   @id @default(cuid())
+  name          String
+  orgnr         String?  @unique
+  address       String?
+  phone         String?
+  email         String?
+  plan          Plan     @default(INVENTORY)
+  trialEndsAt   DateTime?
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Innstillinger
+  primaryColor  String   @default("#007a63")
+  logoUrl       String?
+  timezone      String   @default("Europe/Oslo")
+
+  // Relasjoner
+  users         User[]
+  inventory     InventoryItem[]
+  inventoryLogs InventoryLog[]
+  recipes       Recipe[]
+  shifts        Shift[]
+  employees     Employee[]
+  orders        Order[]
+  bookings      Booking[]
+  tables        Table[]
+  zones         Zone[]
+  chatSessions  ChatSession[]
+  suppliers     Supplier[]
+  invoices      Invoice[]
+}
+
+enum Plan {
+  INVENTORY   // 999 kr/mnd
+  PERFORMANCE // 1999 kr/mnd
+  WORKFORCE   // 2999 kr/mnd
+}
+
+// ─── AUTH ──────────────────────────────────────────────────────────────────
+
+model User {
+  id             String     @id @default(cuid())
+  email          String     @unique
+  passwordHash   String
+  name           String?
+  phone          String?
+  role           UserRole   @default(STAFF)
+  restaurantId   String
+  restaurant     Restaurant @relation(fields: [restaurantId], references: [id])
+  active         Boolean    @default(true)
+  lastLoginAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  refreshTokens  RefreshToken[]
+}
+
+enum UserRole {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// ─── VARELAGER ─────────────────────────────────────────────────────────────
+
+model InventoryItem {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String
+  category     String?    // Kjøtt, Fisk, Meieri, Drikke, etc.
+  unit         String     @default("stk")   // kg, liter, stk, flaske
+  unitPack     String?    // fpak: flaske, boks
+  packSize     Int?       // dpak: antall per kasse
+  stockMin     Float      @default(0)
+  stockMax     Float?
+  stockCurrent Float      @default(0)
+  pricePerUnit Float?
+  supplierId   String?
+  supplier     Supplier?  @relation(fields: [supplierId], references: [id])
+  ean          String?
+  active       Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  logs         InventoryLog[]
+  recipeItems  RecipeItem[]
+  invoiceLines InvoiceLine[]
+}
+
+model InventoryLog {
+  id           String        @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant    @relation(fields: [restaurantId], references: [id])
+  itemId       String
+  item         InventoryItem @relation(fields: [itemId], references: [id])
+  type         LogType
+  qty          Float
+  note         String?
+  userId       String?
+  source       String?       // "voice", "camera", "manual", "pos", "invoice"
+  createdAt    DateTime      @default(now())
+}
+
+enum LogType {
+  COUNT      // varetelling
+  RECEIVE    // mottak fra leverandør
+  TRANSFER   // overføring mellom lager
+  ADJUSTMENT // manuell justering
+  SALE       // trukket av POS-salg
+  WASTE      // svinn
+}
+
+// ─── LEVERANDØRER OG INNKJØP ───────────────────────────────────────────────
+
+model Supplier {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String
+  orgNr        String?
+  email        String?
+  phone        String?
+  createdAt    DateTime   @default(now())
+
+  items        InventoryItem[]
+  invoices     Invoice[]
+}
+
+model Invoice {
+  id           String        @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant    @relation(fields: [restaurantId], references: [id])
+  supplierId   String?
+  supplier     Supplier?     @relation(fields: [supplierId], references: [id])
+  invoiceNr    String?
+  ehfRef       String?       // EHF XML referanse
+  total        Float
+  dueDate      DateTime?
+  paidAt       DateTime?
+  status       InvoiceStatus @default(PENDING)
+  rawEhf       String?       // lagre rå EHF XML
+  createdAt    DateTime      @default(now())
+
+  lines        InvoiceLine[]
+}
+
+enum InvoiceStatus {
+  PENDING
+  APPROVED
+  PAID
+  OVERDUE
+}
+
+model InvoiceLine {
+  id        String        @id @default(cuid())
+  invoiceId String
+  invoice   Invoice       @relation(fields: [invoiceId], references: [id])
+  itemId    String?
+  item      InventoryItem? @relation(fields: [itemId], references: [id])
+  name      String
+  qty       Float
+  unit      String?
+  unitPrice Float
+  total     Float
+}
+
+// ─── RETTER OG OPPSKRIFTER ─────────────────────────────────────────────────
+
+model Recipe {
+  id           String       @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant   @relation(fields: [restaurantId], references: [id])
+  name         String
+  category     String?
+  description  String?
+  sellingPrice Float?
+  imageUrl     String?
+  active       Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  ingredients  RecipeItem[]
+}
+
+model RecipeItem {
+  id       String        @id @default(cuid())
+  recipeId String
+  recipe   Recipe        @relation(fields: [recipeId], references: [id])
+  itemId   String
+  item     InventoryItem @relation(fields: [itemId], references: [id])
+  qty      Float
+  unit     String?
+}
+
+// ─── ANSATTE OG VAKTPLAN ───────────────────────────────────────────────────
+
+model Employee {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  firstName    String
+  lastName     String
+  phone        String?
+  email        String?
+  role         String?    // Servitør, Kokk, Bar, Runner, etc.
+  group        String?    // Planday-gruppe
+  hourlyRate   Float?
+  color        String?    // farge i vaktplan-UI
+  active       Boolean    @default(true)
+  plandayId    String?    // ekstern Planday-ID
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  shifts       Shift[]
+}
+
+model Shift {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  employeeId   String
+  employee     Employee   @relation(fields: [employeeId], references: [id])
+  date         DateTime   // dato for vakten
+  startTime    String     // "10:00"
+  endTime      String     // "20:00"
+  role         String?
+  published    Boolean    @default(false)
+  plandayId    String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+// ─── BESTILLINGER ──────────────────────────────────────────────────────────
+
+model Order {
+  id           String      @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])
+  source       OrderSource @default(MANUAL)
+  status       OrderStatus @default(NEW)
+  tableNumber  String?
+  guestName    String?
+  guestPhone   String?
+  total        Float?
+  note         String?
+  externalId   String?     // Wolt/Foodora order ID
+  receivedAt   DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  items        OrderItem[]
+}
+
+enum OrderSource {
+  MANUAL
+  POS
+  WOLT
+  FOODORA
+  EASYTABLE
+}
+
+enum OrderStatus {
+  NEW
+  CONFIRMED
+  PREPARING
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+model OrderItem {
+  id       String  @id @default(cuid())
+  orderId  String
+  order    Order   @relation(fields: [orderId], references: [id])
+  name     String
+  qty      Int
+  price    Float
+  note     String?
+}
+
+// ─── BOOKING ───────────────────────────────────────────────────────────────
+
+model Zone {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String     // "Inne", "Terrasse", "VIP"
+  color        String?
+  active       Boolean    @default(true)
+
+  tables       Table[]
+}
+
+model Table {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  zoneId       String?
+  zone         Zone?      @relation(fields: [zoneId], references: [id])
+  label        String     // "Bord 1", "Bar 3"
+  seats        Int        @default(4)
+  posX         Float?     // koordinat i bordkart-editor
+  posY         Float?
+  shape        String     @default("rect") // rect, round
+  active       Boolean    @default(true)
+
+  bookings     BookingTable[]
+}
+
+model Booking {
+  id              String        @id @default(cuid())
+  restaurantId    String
+  restaurant      Restaurant    @relation(fields: [restaurantId], references: [id])
+  guestName       String
+  guestPhone      String?
+  guestEmail      String?
+  guestCount      Int
+  date            DateTime
+  time            String        // "19:00"
+  duration        Int           @default(90) // minutter
+  status          BookingStatus @default(PENDING)
+  note            String?
+  internalNote    String?
+  source          String?       // "web", "phone", "easytable"
+  externalId      String?
+  confirmationSms Boolean       @default(false)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  tables          BookingTable[]
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  SEATED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model BookingTable {
+  bookingId String
+  tableId   String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+  table     Table   @relation(fields: [tableId], references: [id])
+
+  @@id([bookingId, tableId])
+}
+
+// ─── CHAT / CRM ────────────────────────────────────────────────────────────
+
+model ChatSession {
+  id           String        @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant    @relation(fields: [restaurantId], references: [id])
+  guestName    String?
+  guestPhone   String?
+  status       ChatStatus    @default(OPEN)
+  assignedTo   String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  messages     ChatMessage[]
+}
+
+enum ChatStatus {
+  OPEN
+  PENDING
+  RESOLVED
+}
+
+model ChatMessage {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id])
+  role        MessageRole
+  content     String
+  aiSuggested Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+}
+
+enum MessageRole {
+  GUEST
+  STAFF
+  AI
+}
