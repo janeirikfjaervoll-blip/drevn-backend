@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('./middleware/auth');
 
 // Alle inventory-routes krever auth
 router.use(requireAuth);
