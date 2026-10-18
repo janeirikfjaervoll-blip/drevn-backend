@@ -14,6 +14,18 @@ function signAccess(user) {
   );
 }
 
+// GET /api/auth/check-orgnr — sjekk om orgnr er ledig (brukes i steg 1 av onboarding)
+router.get('/check-orgnr', async (req, res, next) => {
+  try {
+    const { orgnr } = req.query;
+    if (!orgnr) return res.status(400).json({ error: 'Mangler orgnr' });
+    const clean = orgnr.replace(/\s/g, '');
+    const existing = await req.prisma.restaurant.findFirst({ where: { orgnr: clean } });
+    if (existing) return res.status(409).json({ error: 'Org.nummeret er allerede registrert' });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 // POST /api/auth/register — opprett restaurant + owner-bruker
 router.post('/register', async (req, res, next) => {
   try {
