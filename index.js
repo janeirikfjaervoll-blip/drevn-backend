@@ -22,7 +22,7 @@ app.use((req, res, next) => {
 });
 
 // —— Routes ————————————————————————————————————————
-app.use('/api/auth',        require('./auth'));
+app.use('/api/auth',        require('./auth (1)'));
 app.use('/api/restaurants', require('./restaurants'));
 app.use('/api/inventory',   require('./inventory'));
 app.use('/api/recipes',     require('./recipes'));
