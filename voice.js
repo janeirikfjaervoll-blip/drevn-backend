@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth } = require('./middleware/auth');
 const multer = require('multer');
 const Anthropic = require('@anthropic-ai/sdk');
 
