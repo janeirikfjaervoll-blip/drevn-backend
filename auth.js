@@ -33,41 +33,40 @@ router.post('/register', async (req, res, next) => {
     if (!restaurantName || !email || !password) {
       return res.status(400).json({ error: 'Mangler påkrevde felter' });
     }
+    // Normaliser orgnr (fjern mellomrom)
+    const cleanOrgnr = orgnr ? orgnr.replace(/\s/g, '') : null;
+
     // Sjekk om orgnr allerede er registrert
-    if (orgnr) {
-      const existingRestaurant = await req.prisma.restaurant.findFirst({ where: { orgnr } });
+    if (cleanOrgnr) {
+      const existingRestaurant = await req.prisma.restaurant.findFirst({
+        where: { orgnr: cleanOrgnr }
+      });
       if (existingRestaurant) return res.status(409).json({ error: 'Dette org.nummeret er allerede registrert i Drevn' });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
     const trialEndsAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
 
-    // Finn eksisterende bruker med denne e-posten (kan eie flere restauranter)
-    let user = await req.prisma.user.findUnique({ where: { email } });
+    // Sjekk om e-post allerede er i bruk
+    const existingUser = await req.prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      return res.status(409).json({ error: 'E-postadressen er allerede registrert. Logg inn og legg til ny restaurant derfra.' });
+    }
 
+    // Opprett ny restaurant + bruker
     const restaurant = await req.prisma.restaurant.create({
       data: {
         name: restaurantName,
-        orgnr: orgnr || null,
+        orgnr: cleanOrgnr || null,
         trialEndsAt,
-        ...(user ? {} : {
-          users: {
-            create: { email, passwordHash, name: name || null, role: 'OWNER', active: true }
-          }
-        })
+        users: {
+          create: { email, passwordHash, name: name || null, role: 'OWNER', active: true }
+        }
       },
       include: { users: true }
     });
 
-    // Koble eksisterende bruker til ny restaurant hvis den allerede finnes
-    if (user) {
-      await req.prisma.user.update({
-        where: { id: user.id },
-        data: { restaurantId: restaurant.id }
-      });
-    } else {
-      user = restaurant.users[0];
-    }
+    const user = restaurant.users[0];
     const accessToken = signAccess(user);
     const refreshToken = crypto.randomBytes(40).toString('hex');
 
