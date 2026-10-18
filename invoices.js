@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('./middleware/auth');
 const xml2js = require('xml2js');
 
 router.use(requireAuth);
