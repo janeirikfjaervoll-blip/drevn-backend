@@ -45,6 +45,18 @@ model Restaurant {
   chatSessions  ChatSession[]
   suppliers     Supplier[]
   invoices      Invoice[]
+
+  // Workforce / lønn
+  contracts           EmploymentContract[]
+  ruleSets            RuleSet[]
+  averagingAgreements AveragingAgreement[]
+  timeEntries         TimeEntry[]
+  warnings            ComplianceWarning[]
+  payItems            PayItem[]
+  payPeriods          PayPeriod[]
+  payLines            PayLine[]
+  integrations        Integration[]
+  auditLogs           AuditLog[]
 }
 
 enum Plan {
@@ -69,6 +81,8 @@ model User {
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
   refreshTokens  RefreshToken[]
+  employee       Employee?
+  approvedTimeEntries TimeEntry[] @relation("TimeEntryApprover")
 }
 
 enum UserRole {
@@ -218,42 +232,551 @@ model RecipeItem {
   unit     String?
 }
 
-// ─── ANSATTE OG VAKTPLAN ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── WORKFORCE: ANSATTE, ARBEIDSAVTALER, VAKTPLAN, STEMPLING, LØNNSGRUNNLAG ──
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Flyt:  Shift (plan) → TimeEntry (stempling) → ledergodkjenning
+//        → PayLine (splittet i lønnsarter) → PowerOffice Go (Salary Lines)
+//
+// Prinsipp: satser og regler er DATA (RuleSet/PayRule/WageStep/
+// AveragingAgreement), ikke kode. Regelmotoren leser disse.
+// Alle beløp: Decimal. Alle tidspunkt: DateTime (UTC), tolkes i
+// Restaurant.timezone (Europe/Oslo) ved splitting i tillegg.
+
+// ─── ANSATT ────────────────────────────────────────────────────────────────
 
 model Employee {
-  id           String     @id @default(cuid())
-  restaurantId String
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
-  firstName    String
-  lastName     String
-  phone        String?
-  email        String?
-  role         String?    // Servitør, Kokk, Bar, Runner, etc.
-  group        String?    // Planday-gruppe
-  hourlyRate   Float?
-  color        String?    // farge i vaktplan-UI
-  active       Boolean    @default(true)
-  plandayId    String?    // ekstern Planday-ID
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  id             String     @id @default(cuid())
+  restaurantId   String
+  restaurant     Restaurant @relation(fields: [restaurantId], references: [id])
+  userId         String?    @unique          // innlogging for stempling/egen vaktplan
+  user           User?      @relation(fields: [userId], references: [id])
 
-  shifts       Shift[]
+  employeeNumber String?                       // ansattnr (= PowerOffice ansattnr)
+  firstName      String
+  lastName       String
+  phone          String?
+  email          String?
+  birthDate      DateTime?                     // trengs for aml kap. 11 (under 18)
+  role           String?                       // Servitør, Kokk, Bar, Runner …
+  group          String?                       // vaktgruppe / Planday-gruppe
+  color          String?                       // farge i vaktplan-UI
+  hourlyRate     Float?                        // LEGACY – bruk EmploymentContract
+  active         Boolean    @default(true)
+
+  // Eksterne ID-er
+  plandayId      String?
+  powerOfficeId  String?                       // PowerOffice Go employee id
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  contracts      EmploymentContract[]
+  shifts         Shift[]
+  timeEntries    TimeEntry[]
+  payLines       PayLine[]
+  warnings       ComplianceWarning[]
+
+  @@unique([restaurantId, employeeNumber])
+  @@index([restaurantId, active])
 }
 
+// ─── ARBEIDSAVTALE (per ansatt, datert) ────────────────────────────────────
+// To uavhengige valg:
+//   1) ruleSet: tariff (Riksavtalen) ELLER uten tariff (AML-minimum)
+//   2) averagingAgreement: med ELLER uten gjennomsnittsberegning
+// Ny avtale ved endring (lønnsøkning, stillingsprosent) – aldri overskriv
+// gammel, slik at historiske lønnslinjer kan regnes på nytt korrekt.
+
+model EmploymentContract {
+  id                   String     @id @default(cuid())
+  restaurantId         String
+  restaurant           Restaurant @relation(fields: [restaurantId], references: [id])
+  employeeId           String
+  employee             Employee   @relation(fields: [employeeId], references: [id])
+
+  validFrom            DateTime
+  validTo              DateTime?                  // null = gjeldende
+
+  employmentType       EmploymentType @default(PERMANENT)
+  positionPercent      Decimal    @default(100) @db.Decimal(5, 2)
+  salaryType           SalaryType @default(HOURLY)
+  hourlyRate           Decimal?   @db.Decimal(10, 2)   // timelønn (overstyrer WageStep)
+  monthlySalary        Decimal?   @db.Decimal(12, 2)
+  agreedWeeklyHours    Decimal?   @db.Decimal(5, 2)    // avtalt ukentlig arbeidstid
+
+  // Valg 1: regelsett (tariff eller AML-minimum)
+  ruleSetId            String
+  ruleSet              RuleSet    @relation(fields: [ruleSetId], references: [id])
+  wageStepId           String?                    // ansiennitetstrinn i tariff
+  wageStep             WageStep?  @relation(fields: [wageStepId], references: [id])
+  seniorityDate        DateTime?                  // ansiennitet fra (for auto-opprykk)
+
+  // Valg 2: gjennomsnittsberegning (null = uten)
+  averagingAgreementId String?
+  averagingAgreement   AveragingAgreement? @relation(fields: [averagingAgreementId], references: [id])
+
+  // Kontraktstillegg utover regelsettet (gjelder særlig "uten tariff")
+  extraPayRules        PayRule[]  @relation("ContractPayRules")
+
+  signedAt             DateTime?
+  documentUrl          String?                    // signert arbeidsavtale (PDF)
+  note                 String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  @@index([employeeId, validFrom])
+}
+
+enum EmploymentType {
+  PERMANENT     // fast
+  TEMPORARY     // midlertidig
+  ON_CALL       // tilkallingsvikar / ekstrahjelp
+  APPRENTICE    // lærling
+}
+
+enum SalaryType {
+  HOURLY
+  MONTHLY
+}
+
+// ─── REGELSETT (tariff / AML-minimum) ──────────────────────────────────────
+// restaurantId = null → systemmal levert av Drevn (f.eks. "AML minimum",
+// "Riksavtalen 2026–2028"). Kunden kan kopiere og tilpasse (basedOnId).
+
+model RuleSet {
+  id                    String      @id @default(cuid())
+  restaurantId          String?
+  restaurant            Restaurant? @relation(fields: [restaurantId], references: [id])
+  basedOnId             String?
+  basedOn               RuleSet?    @relation("RuleSetCopy", fields: [basedOnId], references: [id])
+  copies                RuleSet[]   @relation("RuleSetCopy")
+
+  code                  String                    // "AML_MIN", "RIKSAVTALEN_2026"
+  name                  String
+  kind                  RuleSetKind
+  version               Int         @default(1)
+  validFrom             DateTime
+  validTo               DateTime?
+  sourceUrl             String?                   // lenke til tariff/lovtekst
+
+  // Alminnelig arbeidstid (aml § 10-4 / tariff)
+  normalHoursPerDay     Decimal     @default(9)    @db.Decimal(5, 2)
+  normalHoursPerWeek    Decimal     @default(40)   @db.Decimal(5, 2)
+  // Overtid (aml § 10-6)
+  overtimePercent       Decimal     @default(40)   @db.Decimal(5, 2)
+  maxOvertimePer7Days   Decimal     @default(10)   @db.Decimal(5, 2)
+  maxOvertimePer4Weeks  Decimal     @default(25)   @db.Decimal(5, 2)
+  maxOvertimePer52Weeks Decimal     @default(200)  @db.Decimal(6, 2)
+  maxTotalHoursPerDay   Decimal     @default(13)   @db.Decimal(5, 2)
+  maxTotalHoursPer7Days Decimal     @default(48)   @db.Decimal(5, 2)
+  // Hvile (aml § 10-8)
+  minDailyRestHours     Decimal     @default(11)   @db.Decimal(5, 2)
+  minWeeklyRestHours    Decimal     @default(35)   @db.Decimal(5, 2)
+  // Pauser (aml § 10-9)
+  breakRequiredAfterHours Decimal   @default(5.5)  @db.Decimal(4, 2)
+  minBreakMinutesOver8h   Int       @default(30)
+  breakIsPaidDefault      Boolean   @default(false)  // betalt hvis ikke fritt forlate arbeidsplassen
+
+  extra                 Json?                     // regler som ikke har egen kolonne ennå
+
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  payRules              PayRule[]
+  wageSteps             WageStep[]
+  contracts             EmploymentContract[]
+
+  @@unique([restaurantId, code, version])
+}
+
+enum RuleSetKind {
+  STATUTORY   // kun arbeidsmiljøloven
+  TARIFF      // tariffavtale
+  CUSTOM      // kundens egen (basert på en av de over)
+}
+
+// Lønnstrinn i tariff (ansiennitet / kategori)
+model WageStep {
+  id              String    @id @default(cuid())
+  ruleSetId       String
+  ruleSet         RuleSet   @relation(fields: [ruleSetId], references: [id], onDelete: Cascade)
+  category        String                         // "Faglært", "Ufaglært", "Lærling" …
+  minYears        Decimal   @default(0) @db.Decimal(4, 1)
+  minAge          Int?                           // f.eks. ungdomssats
+  hourlyRate      Decimal?  @db.Decimal(10, 2)
+  monthlySalary   Decimal?  @db.Decimal(12, 2)
+  validFrom       DateTime
+  validTo         DateTime?
+
+  contracts       EmploymentContract[]
+
+  @@index([ruleSetId, category, minYears])
+}
+
+// Tillegg/lønnsregel: "når skjer dette, betal så mye, på denne lønnsarten"
+model PayRule {
+  id              String       @id @default(cuid())
+  ruleSetId       String?                         // del av regelsett …
+  ruleSet         RuleSet?     @relation(fields: [ruleSetId], references: [id], onDelete: Cascade)
+  contracts       EmploymentContract[] @relation("ContractPayRules")  // … eller kontraktstillegg
+
+  code            String                          // "KVELD", "NATT", "LORDAG", "SONDAG", "HELLIGDAG", "OT40", "OT100"
+  name            String
+  trigger         PayTrigger
+  // Tidsvindu (lokal tid). Kryss over midnatt: start > end.
+  daysOfWeek      Int[]                           // 1=man … 7=søn; tom = alle
+  startTime       String?                         // "18:00"
+  endTime         String?                         // "06:00"
+  holidayTypes    HolidayType[]                   // gjelder kun disse dagtypene
+  minAge          Int?
+  maxAge          Int?
+
+  amountType      AmountType
+  amount          Decimal      @db.Decimal(10, 2) // kr/t, % av timelønn, eller fast kr
+  payItemCode     String                          // intern lønnsart (PayItem.code)
+  stackable       Boolean      @default(true)     // kan kombineres med andre tillegg
+  priority        Int          @default(0)        // ved ikke-stackable: høyest vinner
+
+  validFrom       DateTime
+  validTo         DateTime?
+  active          Boolean      @default(true)
+}
+
+enum PayTrigger {
+  TIME_WINDOW      // kveld/natt/helg basert på klokkeslett + ukedag
+  HOLIDAY          // helligdag/høytid
+  OVERTIME         // over normalarbeidstid / avtalt tid
+  OVERTIME_HIGH    // f.eks. 100 % etter X timer / helligdag
+  PER_SHIFT        // fast beløp per vakt (f.eks. delt vakt)
+  ALWAYS           // fast timetillegg (kontraktstillegg)
+}
+
+enum AmountType {
+  PER_HOUR         // kr per time
+  PERCENT          // % av grunntimelønn
+  FIXED            // fast kr per forekomst
+}
+
+// Helligdager / høytid som data (genereres årlig)
+model Holiday {
+  id        String      @id @default(cuid())
+  country   String      @default("NO")
+  date      DateTime    @db.Date
+  name      String                              // "1. juledag"
+  type      HolidayType
+  startTime String?                             // f.eks. julaften fra "15:00"
+
+  @@unique([country, date, type])
+}
+
+enum HolidayType {
+  PUBLIC_HOLIDAY   // helligdag
+  HIGH_HOLIDAY     // høytidsaften (jul-/påske-/pinseaften, nyttårsaften)
+  SUNDAY
+}
+
+// ─── GJENNOMSNITTSBEREGNING (aml § 10-5) ───────────────────────────────────
+// Defaults = alternativ 1 (individuell skriftlig avtale).
+
+model AveragingAgreement {
+  id                   String        @id @default(cuid())
+  restaurantId         String
+  restaurant           Restaurant    @relation(fields: [restaurantId], references: [id])
+  name                 String
+  legalBasis           AveragingBasis @default(AML_10_5_1)
+
+  periodStart          DateTime
+  periodWeeks          Int                          // maks 52
+  avgWeeklyHours       Decimal       @db.Decimal(5, 2)  // snitt over perioden (≤ normalHoursPerWeek)
+  maxHoursPerDay       Decimal       @default(10)  @db.Decimal(5, 2)   // alt. 2: 12,5
+  maxHoursPer7Days     Decimal       @default(48)  @db.Decimal(5, 2)
+  peakAvgWindowWeeks   Int           @default(8)                       // 48 t kan snittes over 8 uker …
+  peakMaxHoursPerWeek  Decimal       @default(50)  @db.Decimal(5, 2)   // … men aldri over 50 (alt. 2: 54)
+
+  documentUrl          String?
+  approvedRef          String?                      // Arbeidstilsynet-saksnr (alt. 3)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  contracts            EmploymentContract[]
+}
+
+enum AveragingBasis {
+  AML_10_5_1   // individuell skriftlig avtale
+  AML_10_5_2   // tariffbundet, avtale med tillitsvalgte
+  AML_10_5_3   // samtykke fra Arbeidstilsynet
+}
+
+// ─── VAKT (plan) ───────────────────────────────────────────────────────────
+
 model Shift {
-  id           String     @id @default(cuid())
-  restaurantId String
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
-  employeeId   String
-  employee     Employee   @relation(fields: [employeeId], references: [id])
-  date         DateTime   // dato for vakten
-  startTime    String     // "10:00"
-  endTime      String     // "20:00"
-  role         String?
-  published    Boolean    @default(false)
-  plandayId    String?
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  id            String      @id @default(cuid())
+  restaurantId  String
+  restaurant    Restaurant  @relation(fields: [restaurantId], references: [id])
+  employeeId    String?                           // null = ledig vakt
+  employee      Employee?   @relation(fields: [employeeId], references: [id])
+
+  date          DateTime    @db.Date              // vaktens "arbeidsdag" (lokal dato)
+  startAt       DateTime
+  endAt         DateTime                          // kan krysse midnatt
+  breakMinutes  Int         @default(0)
+  breakPaid     Boolean     @default(false)
+  role          String?
+  note          String?
+  status        ShiftStatus @default(DRAFT)
+  publishedAt   DateTime?
+  plandayId     String?
+  createdById   String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  timeEntries   TimeEntry[]
+  warnings      ComplianceWarning[]
+
+  @@index([restaurantId, date])
+  @@index([employeeId, startAt])
+}
+
+enum ShiftStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+}
+
+// ─── STEMPLING + GODKJENNING ───────────────────────────────────────────────
+// Original stempling bevares alltid; leder justerer via approved*-felter.
+
+model TimeEntry {
+  id               String          @id @default(cuid())
+  restaurantId     String
+  restaurant       Restaurant      @relation(fields: [restaurantId], references: [id])
+  employeeId       String
+  employee         Employee        @relation(fields: [employeeId], references: [id])
+  shiftId          String?
+  shift            Shift?          @relation(fields: [shiftId], references: [id])
+
+  // Rå stempling
+  clockInAt        DateTime
+  clockOutAt       DateTime?                      // null = pågår
+  breakMinutes     Int             @default(0)
+  source           ClockSource     @default(APP)
+  clockInGeo       Json?                          // {lat,lng,acc} ved mobilstempling
+  clockOutGeo      Json?
+
+  // Godkjent (justert av leder)
+  approvedStartAt  DateTime?
+  approvedEndAt    DateTime?
+  approvedBreakMin Int?
+  breakPaid        Boolean         @default(false)
+
+  status           TimeEntryStatus @default(OPEN)
+  approvedById     String?
+  approvedBy       User?           @relation("TimeEntryApprover", fields: [approvedById], references: [id])
+  approvedAt       DateTime?
+  rejectReason     String?
+  employeeComment  String?
+  managerComment   String?
+
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  payLines         PayLine[]
+  warnings         ComplianceWarning[]
+
+  @@index([restaurantId, status])
+  @@index([employeeId, clockInAt])
+}
+
+enum ClockSource {
+  APP        // ansattes mobil
+  KIOSK      // felles nettbrett i restauranten
+  POS        // stemplet via kasse (Ninito)
+  MANUAL     // registrert av leder
+  PLANDAY    // importert
+}
+
+enum TimeEntryStatus {
+  OPEN        // stemplet inn, ikke ut
+  SUBMITTED   // stemplet ut, venter på godkjenning
+  APPROVED    // godkjent → kan generere lønnslinjer
+  REJECTED
+  LOCKED      // inngår i låst/eksportert lønnsperiode
+}
+
+// ─── AVVIK / BRUDD (aml + avtale) ──────────────────────────────────────────
+// Genereres ved planlegging (Shift) og ved godkjenning (TimeEntry).
+// Leder kan overstyre med begrunnelse – logges.
+
+model ComplianceWarning {
+  id              String          @id @default(cuid())
+  restaurantId    String
+  restaurant      Restaurant      @relation(fields: [restaurantId], references: [id])
+  employeeId      String
+  employee        Employee        @relation(fields: [employeeId], references: [id])
+  shiftId         String?
+  shift           Shift?          @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  timeEntryId     String?
+  timeEntry       TimeEntry?      @relation(fields: [timeEntryId], references: [id], onDelete: Cascade)
+
+  ruleCode        String                         // "DAILY_REST_11H", "MAX_OT_7D", "AVG_PERIOD" …
+  legalRef        String?                        // "aml § 10-8 (1)"
+  severity        WarningSeverity
+  message         String
+  details         Json?                          // {actual: 9.5, limit: 11, window: {...}}
+
+  acknowledgedById String?
+  acknowledgedAt   DateTime?
+  overrideReason   String?
+  createdAt        DateTime       @default(now())
+
+  @@index([restaurantId, employeeId, createdAt])
+}
+
+enum WarningSeverity {
+  INFO
+  WARNING     // avvik fra avtale
+  VIOLATION   // brudd på aml – krever begrunnelse for å publisere/godkjenne
+}
+
+// ─── LØNNSARTER + LØNNSLINJER → POWEROFFICE GO ─────────────────────────────
+
+// Intern lønnsart per restaurant, mappet mot kundens PowerOffice i onboarding
+model PayItem {
+  id                  String     @id @default(cuid())
+  restaurantId        String
+  restaurant          Restaurant @relation(fields: [restaurantId], references: [id])
+  code                String                      // "ORD", "KVELD", "OT40" … (matcher PayRule.payItemCode)
+  name                String
+  unit                PayUnit    @default(HOURS)
+  powerOfficeId       String?                     // PowerOffice Pay Item id
+  powerOfficeCode     String?                     // lønnsartnummer hos kunden
+  active              Boolean    @default(true)
+
+  payLines            PayLine[]
+
+  @@unique([restaurantId, code])
+}
+
+enum PayUnit {
+  HOURS
+  AMOUNT
+  COUNT
+}
+
+model PayPeriod {
+  id            String          @id @default(cuid())
+  restaurantId  String
+  restaurant    Restaurant      @relation(fields: [restaurantId], references: [id])
+  fromDate      DateTime        @db.Date
+  toDate        DateTime        @db.Date
+  status        PayPeriodStatus @default(OPEN)
+  lockedAt      DateTime?
+  lockedById    String?
+  exportedAt    DateTime?
+  createdAt     DateTime        @default(now())
+
+  payLines      PayLine[]
+
+  @@unique([restaurantId, fromDate, toDate])
+}
+
+enum PayPeriodStatus {
+  OPEN        // lønnslinjer kan regenereres
+  LOCKED      // frosset, klar til eksport
+  EXPORTED    // sendt til PowerOffice
+}
+
+model PayLine {
+  id             String        @id @default(cuid())
+  restaurantId   String
+  restaurant     Restaurant    @relation(fields: [restaurantId], references: [id])
+  employeeId     String
+  employee       Employee      @relation(fields: [employeeId], references: [id])
+  timeEntryId    String?                         // null = manuell linje (bonus, trekk …)
+  timeEntry      TimeEntry?    @relation(fields: [timeEntryId], references: [id])
+  payPeriodId    String?
+  payPeriod      PayPeriod?    @relation(fields: [payPeriodId], references: [id])
+  payItemId      String
+  payItem        PayItem       @relation(fields: [payItemId], references: [id])
+  payRuleId      String?                         // hvilken regel som ga linjen (sporbarhet)
+
+  workDate       DateTime      @db.Date
+  quantity       Decimal       @db.Decimal(8, 2) // timer / antall
+  rate           Decimal       @db.Decimal(10, 2)
+  amount         Decimal       @db.Decimal(12, 2)
+  description    String?
+
+  status         PayLineStatus @default(DRAFT)
+  externalId     String?                         // PowerOffice salary line id
+  exportedAt     DateTime?
+  exportError    String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([restaurantId, payPeriodId])
+  @@index([employeeId, workDate])
+}
+
+enum PayLineStatus {
+  DRAFT
+  READY
+  EXPORTED
+  FAILED
+}
+
+// ─── INTEGRASJONER (PowerOffice, Planday, Ninito …) ────────────────────────
+
+model Integration {
+  id            String              @id @default(cuid())
+  restaurantId  String
+  restaurant    Restaurant          @relation(fields: [restaurantId], references: [id])
+  provider      IntegrationProvider
+  status        IntegrationStatus   @default(PENDING)
+  credentials   String?                          // AES-kryptert JSON – aldri klartekst
+  settings      Json?                            // f.eks. {payrollRunDay: 20}
+  lastSyncAt    DateTime?
+  lastError     String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@unique([restaurantId, provider])
+}
+
+enum IntegrationProvider {
+  POWEROFFICE
+  PLANDAY
+  TRIPLETEX
+  FIKEN
+  NINITO
+  WOLT
+  FOODORA
+  EASYTABLE
+}
+
+enum IntegrationStatus {
+  PENDING
+  ACTIVE
+  ERROR
+  DISABLED
+}
+
+// ─── REVISJONSLOGG (lønnsrelevante endringer) ──────────────────────────────
+
+model AuditLog {
+  id            String     @id @default(cuid())
+  restaurantId  String
+  restaurant    Restaurant @relation(fields: [restaurantId], references: [id])
+  userId        String?
+  entity        String                           // "TimeEntry", "EmploymentContract" …
+  entityId      String
+  action        String                           // "approve", "adjust", "override_warning" …
+  before        Json?
+  after         Json?
+  createdAt     DateTime   @default(now())
+
+  @@index([restaurantId, entity, entityId])
 }
 
 // ─── BESTILLINGER ──────────────────────────────────────────────────────────
